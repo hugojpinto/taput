@@ -1,0 +1,5 @@
+# Build artifacts
+/taput
+/taput.o
+/taput-linux
+/taput.exe
