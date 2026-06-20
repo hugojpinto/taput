@@ -4,6 +4,14 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+    #include <direct.h>
+    #define MKDIR(p) _mkdir(p)
+#else
+    #define MKDIR(p) mkdir((p), 0755)
+#endif
 
 #define MAX_SELECTED_BLOCKS 10
 #define MAX_PATH 260
@@ -38,7 +46,10 @@ enum command
     cm_Remove,
     cm_Replace,
     cm_Fix0,
-    cm_FixCrc
+    cm_FixCrc,
+    cm_ExportPng,
+    cm_ExportAll,
+    cm_Info
 } Command
     = cm_Unknown;
 
@@ -80,6 +91,9 @@ struct selectedblocks
 bool AddTapeHeader = false;
 bool RawData = false;
 bool QuietMode = false;
+bool WriteInf = false;          // export-all: also emit .inf sidecars
+int  BasicVarsParam = -1;       // BASIC param2 (prog length before vars); -1 = auto
+const char *InfPath = NULL;     // --from-inf <file> source for header reconstruction
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 
@@ -91,9 +105,15 @@ void showUsage(void)
     "Commands:\n"
     "    add              Add a file at the end of the \"tap\" image\n"
     "                     if the image does not exist, it will be created\n"
+    "    export-all       Extract every data block to its own file in the\n"
+    "                     given folder (named after the header); --inf also\n"
+    "                     writes a .inf metadata sidecar per file\n"
+    "    export-png       Render a SCREEN$ block (or .scr file with no -s)\n"
+    "                     to a 256x192 PNG image\n"
     "    extract          Extract a block of data to a file\n"
     "    fix-0            Remove empty blocks from the image\n"
     "    fix-crc          Correct the checksum of the selected blocks\n"
+    "    info             Show a summary of the image (block counts, integrity)\n"
     "    insert           Insert a file at the beginning of the image,\n"
     "                     with the -s <n> option inserts a file before block n\n"
     "    list             List image content\n"
@@ -102,7 +122,10 @@ void showUsage(void)
     "    replace          Replace the data block with the contents of the file\n"
     "Options:\n"
     "    -b               Creates a BASIC program header block\n"
+    "    --from-inf <f>   Read header name/type/address from a .inf file\n"
+    "                     (use with add / insert / replace)\n"
     "    -h, --help       Display this help and exit\n"
+    "    --inf            With export-all, also write .inf metadata sidecars\n"
     "    -n <name>        Implies creating a block header,\n"
     "                     <name> sets a block name\n"
     "    -o <addr>        Implies creating a block header,\n"
@@ -113,7 +136,10 @@ void showUsage(void)
     "                     Selects the block numbers and/or block ranges (up to " MAX_SELECTED_BLOCKS_S ")\n"
     "Examples:\n"
     "    taput add -o 32768 -n \"Block name\" file.bin image.tap\n"
+    "    taput export-all --inf image.tap ./out\n"
+    "    taput export-png -s 2 image.tap screen.png\n"
     "    taput extract -s 2 image.tap file.bin\n"
+    "    taput info image.tap\n"
     "    taput fix-0 image.tap\n"
     "    taput fix-crc -s 3 image.tap\n"
     "    taput insert -s 3 -o 32768 -n \"Block name\" file.bin image.tap\n"
@@ -140,9 +166,15 @@ void PrepareTapeHeader(int size)
     switch (TapeHeader.HType)
     {
         case DT_BASIC:
-            TapeHeader.HParam2Lo = (byte)(size & 0xff);
-            TapeHeader.HParam2Hi = (byte)(size >> 8);
+        {
+            // param2 = length of the program before its variables. When a
+            // .inf supplied an explicit value (BasicVarsParam) keep it,
+            // otherwise default to the whole size (no variables saved).
+            int p2 = (BasicVarsParam >= 0) ? BasicVarsParam : size;
+            TapeHeader.HParam2Lo = (byte)(p2 & 0xff);
+            TapeHeader.HParam2Hi = (byte)(p2 >> 8);
             break;
+        }
         case DT_CODE:
             TapeHeader.HParam2Lo = 0x00;
             TapeHeader.HParam2Hi = 0x80;
@@ -267,7 +299,7 @@ void cmdAdd(const char *FileNameIn, const char *FileNameOut)
     // re-write old file
     if (bufferOut)
     {
-        for (int i = 1; pos < endbuf; i++)
+        while (pos < endbuf)
         {
             size_t blocksize = pos[0] | (pos[1] << 8);
 
@@ -660,7 +692,7 @@ void cmdFix0(const char *FileName)
         free(buffer);
         exit(1);
     }
-    for (int i = 1; pos < endbuf; i++)
+    while (pos < endbuf)
     {
         size_t blocksize = pos[0] | (pos[1] << 8);
         if (blocksize)
@@ -870,6 +902,509 @@ void cmdList(const char *FileNameIn)
     }
 }
 
+//~~~~ PNG export ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
+// Renders a ZX Spectrum SCREEN$ (6912 bytes: 6144 pixel + 768 attribute)
+// to a 256x192 truecolour PNG. The encoder is self-contained: it emits
+// stored (uncompressed) DEFLATE blocks so no zlib dependency is needed.
+
+#define SCR_PIXELS 6144
+#define SCR_SIZE   6912
+#define SCR_W      256
+#define SCR_H      192
+
+// CRC-32 (IEEE) over a buffer, chained via the running (pre-inverted) value.
+uint32_t crc32buf(const byte *buf, size_t len, uint32_t crc)
+{
+    for (size_t n = 0; n < len; n++)
+    {
+        crc ^= buf[n];
+        for (int k = 0; k < 8; k++)
+            crc = (crc & 1) ? (crc >> 1) ^ 0xedb88320UL : crc >> 1;
+    }
+    return crc;
+}
+
+uint32_t adler32buf(const byte *data, size_t len)
+{
+    uint32_t a = 1, b = 0;
+    for (size_t i = 0; i < len; i++)
+    {
+        a = (a + data[i]) % 65521;
+        b = (b + a) % 65521;
+    }
+    return (b << 16) | a;
+}
+
+// Wrap raw data in a zlib stream using only stored DEFLATE blocks.
+byte *zlibStore(const byte *data, size_t len, size_t *outLen)
+{
+    size_t nblocks = (len + 65534) / 65535;
+    if (nblocks == 0) nblocks = 1;
+    byte *out = (byte*)malloc(2 + nblocks * 5 + len + 4);
+    if (!out) return NULL;
+
+    size_t p = 0;
+    out[p++] = 0x78;            // CMF: deflate, 32K window
+    out[p++] = 0x01;            // FLG: check bits, no preset dict
+    size_t off = 0;
+    do {
+        size_t chunk = len - off;
+        if (chunk > 65535) chunk = 65535;
+        uint16_t n = (uint16_t)chunk;
+        out[p++] = (off + chunk >= len) ? 1 : 0;   // BFINAL, BTYPE=00 (stored)
+        out[p++] = n & 0xff;
+        out[p++] = (n >> 8) & 0xff;
+        out[p++] = (~n) & 0xff;                     // NLEN = ~LEN
+        out[p++] = (~n >> 8) & 0xff;
+        if (chunk) memcpy(out + p, data + off, chunk);
+        p += chunk;
+        off += chunk;
+    } while (off < len);
+
+    uint32_t ad = adler32buf(data, len);
+    out[p++] = (ad >> 24) & 0xff;
+    out[p++] = (ad >> 16) & 0xff;
+    out[p++] = (ad >> 8) & 0xff;
+    out[p++] = ad & 0xff;
+    *outLen = p;
+    return out;
+}
+
+void writePngChunk(FILE *file, const char *type, const byte *data,
+                   size_t len, const char *fileName)
+{
+    byte lenb[4] = { (byte)(len >> 24), (byte)(len >> 16),
+                     (byte)(len >> 8), (byte)len };
+    writeBlock(lenb, 4, file, fileName);
+    writeBlock((void*)type, 4, file, fileName);
+    if (len) writeBlock((void*)data, len, file, fileName);
+
+    uint32_t c = crc32buf((const byte*)type, 4, 0xffffffffUL);
+    c = crc32buf(data, len, c) ^ 0xffffffffUL;
+    byte crcb[4] = { (byte)(c >> 24), (byte)(c >> 16),
+                     (byte)(c >> 8), (byte)c };
+    writeBlock(crcb, 4, file, fileName);
+}
+
+void writePng(const byte *screen, const char *FileNameOut)
+{
+    size_t rawLen = (size_t)SCR_H * (1 + SCR_W * 3);
+    byte *raw = (byte*)malloc(rawLen);
+    if (!raw)
+    {
+        fprintf(stderr, "Memory allocation error\n");
+        exit(1);
+    }
+
+    size_t rp = 0;
+    for (int y = 0; y < SCR_H; y++)
+    {
+        raw[rp++] = 0;          // filter type 0 (none)
+        for (int x = 0; x < SCR_W; x++)
+        {
+            int off = (x >> 3) + (y & 7) * 256
+                    + ((y >> 3) & 7) * 32 + (y >> 6) * 2048;
+            int on = (screen[off] >> (7 - (x & 7))) & 1;
+            byte attr = screen[SCR_PIXELS + (y >> 3) * 32 + (x >> 3)];
+            int colour = on ? (attr & 7) : ((attr >> 3) & 7);
+            int v = (attr & 0x40) ? 255 : 205;     // bright bit
+            raw[rp++] = (colour & 2) ? v : 0;      // red
+            raw[rp++] = (colour & 4) ? v : 0;      // green
+            raw[rp++] = (colour & 1) ? v : 0;      // blue
+        }
+    }
+
+    size_t zlen;
+    byte *zdata = zlibStore(raw, rawLen, &zlen);
+    free(raw);
+    if (!zdata)
+    {
+        fprintf(stderr, "Memory allocation error\n");
+        exit(1);
+    }
+
+    FILE *file = fopen(FileNameOut, "wb");
+    if (!file)
+    {
+        fprintf(stderr, "Unable to create file \"%s\"\n", FileNameOut);
+        free(zdata);
+        exit(1);
+    }
+
+    static const byte sig[8] = { 137, 80, 78, 71, 13, 10, 26, 10 };
+    byte ihdr[13] = {
+        (SCR_W >> 24) & 0xff, (SCR_W >> 16) & 0xff,
+        (SCR_W >> 8) & 0xff, SCR_W & 0xff,
+        (SCR_H >> 24) & 0xff, (SCR_H >> 16) & 0xff,
+        (SCR_H >> 8) & 0xff, SCR_H & 0xff,
+        8,      // bit depth
+        2,      // colour type: truecolour RGB
+        0, 0, 0 // compression, filter, interlace
+    };
+    writeBlock((void*)sig, 8, file, FileNameOut);
+    writePngChunk(file, "IHDR", ihdr, 13, FileNameOut);
+    writePngChunk(file, "IDAT", zdata, zlen, FileNameOut);
+    writePngChunk(file, "IEND", NULL, 0, FileNameOut);
+    fclose(file);
+    free(zdata);
+}
+
+// Copy SCREEN$ data into a full 6912-byte buffer. When attribute data is
+// absent (only pixel data supplied), default to black ink on white paper.
+void loadScreen(byte *screen, const byte *src, int len)
+{
+    if (len > SCR_SIZE) len = SCR_SIZE;
+    if (len < 0) len = 0;
+    memset(screen, 0, SCR_SIZE);
+    if (len) memcpy(screen, src, len);
+    if (len < SCR_SIZE)
+        memset(screen + SCR_PIXELS, 0x38, 768);   // PAPER 7, INK 0
+}
+
+void cmdExportPng(const char *FileNameIn, const char *FileNameOut)
+{
+    byte screen[SCR_SIZE];
+
+    // No block selected: treat the input as a standalone SCREEN$ (.scr) file.
+    if (SelectedBlocks.count == 0)
+    {
+        size_t size;
+        byte *buffer = LoadFile(&size, FileNameIn);
+        if (!buffer)
+        {
+            fprintf(stderr, "Unable to open file \"%s\"\n", FileNameIn);
+            exit(1);
+        }
+        if (size < SCR_PIXELS)
+        {
+            fprintf(stderr, "File \"%s\" is too small for a SCREEN$ "
+                "(need at least %d bytes)\n", FileNameIn, SCR_PIXELS);
+            free(buffer);
+            exit(1);
+        }
+        loadScreen(screen, buffer, (int)size);
+        free(buffer);
+        writePng(screen, FileNameOut);
+        return;
+    }
+
+    // A block was selected: pull the SCREEN$ out of the tap image.
+    if (SelectedBlocks.count != 1 ||
+        SelectedBlocks.block[0].start != SelectedBlocks.block[0].end)
+    {
+        fprintf(stderr, "Exactly one block should be selected\n");
+        exit(1);
+    }
+
+    size_t size;
+    byte *buffer = LoadFile(&size, FileNameIn);
+    if (!buffer)
+    {
+        fprintf(stderr, "Unable to open file \"%s\"\n", FileNameIn);
+        exit(1);
+    }
+    byte *endbuf = buffer + size;
+    byte *pos = buffer;
+    bool found = false;
+    for (int i = 1; pos < endbuf; i++)
+    {
+        size_t blocksize = pos[0] | (pos[1] << 8);
+        if (isSelected(i))
+        {
+            byte *payload;
+            int len, avail;
+            if (RawData)
+            {
+                payload = pos + 2;
+                len = (int)blocksize;
+                avail = (int)(endbuf - payload);
+            } else {
+                payload = pos + 3;
+                len = blocksize >= 2 ? (int)blocksize - 2 : 0;
+                avail = (int)(endbuf - payload);
+            }
+            if (avail < 0) avail = 0;
+            if (len > avail) len = avail;
+            loadScreen(screen, payload, len);
+            found = true;
+            break;
+        }
+        pos += blocksize + 2;
+    }
+    free(buffer);
+
+    if (!found)
+    {
+        fprintf(stderr, "Selected block was not found\n");
+        exit(1);
+    }
+    writePng(screen, FileNameOut);
+}
+
+//~~~~ .inf metadata + batch export ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
+
+const char *typeName(int t)
+{
+    switch (t)
+    {
+        case DT_BASIC:     return "BASIC";
+        case DT_NUMARRAY:  return "NUMARRAY";
+        case DT_CHARARRAY: return "CHARARRAY";
+        default:           return "CODE";
+    }
+}
+
+int typeFromName(const char *s)
+{
+    if (!strcasecmp(s, "BASIC"))                              return DT_BASIC;
+    if (!strcasecmp(s, "NUMARRAY") || !strcasecmp(s, "NUMBER"))    return DT_NUMARRAY;
+    if (!strcasecmp(s, "CHARARRAY") || !strcasecmp(s, "CHAR"))     return DT_CHARARRAY;
+    if (!strcasecmp(s, "CODE") || !strcasecmp(s, "BYTES"))    return DT_CODE;
+    return -1;
+}
+
+// Make a filesystem-safe base name (<=10 chars) from a Spectrum block name.
+void sanitizeName(char *dst, const char *src)
+{
+    int n = 0;
+    for (int j = 0; j < 10; j++)
+    {
+        unsigned char c = (unsigned char)src[j];
+        if (c == ' ' || c == '\0') continue;
+        if (!isprint(c) || c == '/' || c == '\\' || c == ':') c = '_';
+        dst[n++] = (char)c;
+    }
+    dst[n] = '\0';
+}
+
+void writeInfFile(const char *path, struct tapeheader *h)
+{
+    FILE *f = fopen(path, "w");
+    if (!f)
+    {
+        fprintf(stderr, "W : cannot create \"%s\"\n", path);
+        return;
+    }
+    int len   = h->HLenLo    | (h->HLenHi    << 8);
+    int start = h->HStartLo  | (h->HStartHi  << 8);
+    int p2    = h->HParam2Lo | (h->HParam2Hi << 8);
+    char name[11];
+    for (int j = 0; j < 10; j++)
+        name[j] = isprint((unsigned char)h->HName[j]) ? h->HName[j] : ' ';
+    name[10] = '\0';
+    for (int e = 10; e > 0 && name[e - 1] == ' '; e--)
+        name[e - 1] = '\0';
+
+    fprintf(f, "File   : %s\n", name);
+    fprintf(f, "type   : %s\n", typeName(h->HType));
+    fprintf(f, "name   : %s\n", name);
+    fprintf(f, "start  : %d\n", start);
+    fprintf(f, "len    : %d\n", len);
+    if (h->HType == DT_BASIC)
+        fprintf(f, "vars   : %d\n", p2);
+    fclose(f);
+}
+
+static char *trim(char *s)
+{
+    while (*s == ' ' || *s == '\t' || *s == '\r') s++;
+    int e = (int)strlen(s);
+    while (e > 0 && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r'))
+        s[--e] = '\0';
+    return s;
+}
+
+// Read a .inf file and populate the global TapeHeader for the next add/insert/replace.
+void loadInf(const char *path)
+{
+    size_t sz;
+    byte *buf = LoadFile(&sz, path);
+    if (!buf)
+    {
+        fprintf(stderr, "Unable to open \"%s\"\n", path);
+        exit(1);
+    }
+    buf[sz] = '\0';
+    AddTapeHeader = true;
+
+    char *line = (char*)buf;
+    while (*line)
+    {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        char *colon = strchr(line, ':');
+        if (colon)
+        {
+            *colon = '\0';
+            char *key = trim(line);
+            char *val = trim(colon + 1);
+            if (!strcasecmp(key, "type"))
+            {
+                int t = typeFromName(val);
+                if (t >= 0) TapeHeader.HType = (byte)t;
+            }
+            else if (!strcasecmp(key, "name"))
+            {
+                int L = (int)strlen(val);
+                for (int j = 0; j < 10; j++)
+                    TapeHeader.HName[j] = (j < L) ? val[j] : ' ';
+            }
+            else if (!strcasecmp(key, "start"))
+            {
+                int a = atoi(val);
+                TapeHeader.HStartLo = (byte)(a & 0xff);
+                TapeHeader.HStartHi = (byte)(a >> 8);
+            }
+            else if (!strcasecmp(key, "vars"))
+                BasicVarsParam = atoi(val);
+        }
+        if (!nl) break;
+        line = nl + 1;
+    }
+    free(buf);
+}
+
+void cmdExportAll(const char *FileNameIn, const char *dirArg)
+{
+    const char *dir = (dirArg && dirArg[0]) ? dirArg : ".";
+    size_t size;
+    byte *buffer = LoadFile(&size, FileNameIn);
+    if (!buffer)
+    {
+        fprintf(stderr, "Unable to open file \"%s\"\n", FileNameIn);
+        exit(1);
+    }
+    if (dirArg && dirArg[0])
+        MKDIR(dir);
+
+    byte *endbuf = buffer + size;
+    byte *pos = buffer;
+    struct tapeheader *pending = NULL;     // last header block seen
+    int fileCount = 0, infCount = 0;
+
+    for (int i = 1; pos < endbuf; i++)
+    {
+        size_t blocksize = (pos + 1 < endbuf) ? (pos[0] | (pos[1] << 8)) : pos[0];
+        bool isHeader = (blocksize == 19) && (pos + 2 < endbuf) && (pos[2] == 0x00);
+
+        if (isHeader)
+        {
+            pending = (struct tapeheader*)pos;
+            pos += blocksize + 2;
+            continue;
+        }
+
+        // Anything else with content is treated as a data block -> one file.
+        byte *payload;
+        int len;
+        if (RawData) { payload = pos + 2; len = (int)blocksize; }
+        else         { payload = pos + 3; len = blocksize >= 2 ? (int)blocksize - 2 : 0; }
+        int avail = (int)(endbuf - payload);
+        if (avail < 0) avail = 0;
+        if (len > avail) len = avail;
+        if (len < 0) len = 0;
+
+        char base[16] = "";
+        const char *ext = "bin";
+        if (pending)
+        {
+            sanitizeName(base, pending->HName);
+            int st = pending->HStartLo | (pending->HStartHi << 8);
+            if (pending->HType == DT_CODE && len == 6912 && st == 16384)
+                ext = "scr";                       // a SCREEN$ -> export-png ready
+        }
+
+        char fname[MAX_PATH + 40];
+        if (base[0])
+            snprintf(fname, sizeof fname, "%s/%02d_%s.%s", dir, i, base, ext);
+        else
+            snprintf(fname, sizeof fname, "%s/%02d.%s", dir, i, ext);
+
+        FILE *f = fopen(fname, "wb");
+        if (!f)
+        {
+            fprintf(stderr, "Unable to create file \"%s\"\n", fname);
+            free(buffer);
+            exit(1);
+        }
+        if (len) writeBlock(payload, len, f, fname);
+        fclose(f);
+        fileCount++;
+        if (!QuietMode)
+            printf("o : %s (%d bytes)\n", fname, len);
+
+        if (WriteInf && pending)
+        {
+            char infname[MAX_PATH + 48];
+            snprintf(infname, sizeof infname, "%s.inf", fname);
+            writeInfFile(infname, pending);
+            infCount++;
+        }
+        pending = NULL;
+        pos += blocksize + 2;
+    }
+    free(buffer);
+
+    if (!QuietMode)
+    {
+        printf("O : %d file(s) exported to \"%s\"", fileCount, dir);
+        if (WriteInf) printf(" (%d .inf)", infCount);
+        printf("\n");
+    }
+}
+
+void cmdInfo(const char *FileNameIn)
+{
+    size_t size;
+    byte *buffer = LoadFile(&size, FileNameIn);
+    if (!buffer)
+    {
+        fprintf(stderr, "Unable to open file \"%s\"\n", FileNameIn);
+        exit(1);
+    }
+    byte *endbuf = buffer + size;
+    byte *pos = buffer;
+    int blocks = 0, headers = 0, datablk = 0, empty = 0, badcrc = 0, other = 0;
+    long databytes = 0;
+    bool corrupt = false;
+
+    while (pos < endbuf)
+    {
+        size_t blocksize = (pos + 1 < endbuf) ? (pos[0] | (pos[1] << 8)) : pos[0];
+        blocks++;
+        if (blocksize == 0) { empty++; pos += 2; continue; }
+        if ((pos + blocksize + 1) < endbuf)
+        {
+            if (blocksize > 1)
+            {
+                byte c = crc(&pos[2], blocksize - 1);
+                if (pos[blocksize + 1] != c) badcrc++;
+            }
+            byte flag = pos[2];
+            if (flag == 0x00 && blocksize == 19) headers++;
+            else if (flag == 0xff) { datablk++; databytes += (long)blocksize - 2; }
+            else other++;
+        }
+        else
+            corrupt = true;
+        pos += blocksize + 2;
+    }
+    if (pos != endbuf) corrupt = true;
+    free(buffer);
+
+    printf("o : File          : %s\n", FileNameIn);
+    printf("o : Size          : %ld bytes\n", (long)size);
+    printf("o : Blocks        : %d\n", blocks);
+    printf("o : Headers       : %d\n", headers);
+    printf("o : Data blocks   : %d\n", datablk);
+    printf("o : Data bytes    : %ld\n", databytes);
+    if (empty)  printf("o : Empty blocks  : %d\n", empty);
+    if (other)  printf("o : Other blocks  : %d\n", other);
+    if (badcrc) printf("W : Bad checksums : %d\n", badcrc);
+    printf(corrupt ? "W : Integrity     : CORRUPTED\n"
+                   : "O : Integrity     : OK\n");
+}
+
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 
 int main(int argc, char **argv)
@@ -977,6 +1512,19 @@ int main(int argc, char **argv)
                     }
                     else if (strcasecmp(&argv[i][2], "raw") == 0)
                         RawData = true;
+                    else if (strcasecmp(&argv[i][2], "inf") == 0)
+                        WriteInf = true;
+                    else if (strcasecmp(&argv[i][2], "from-inf") == 0)
+                    {
+                        if ((i + 1) < argc)
+                        {
+                            InfPath = argv[i + 1];
+                            i++;
+                        } else {
+                            fprintf(stderr, "Missing parameter");
+                            AllOk = false;
+                        }
+                    }
                     else {
                         fprintf(stderr, "Unknown option");
                         AllOk = false;
@@ -1005,6 +1553,12 @@ int main(int argc, char **argv)
                 Command = cm_Fix0;
             else if (strcasecmp(argv[i], "fix-crc") == 0)
                 Command = cm_FixCrc;
+            else if (strcasecmp(argv[i], "export-png") == 0)
+                Command = cm_ExportPng;
+            else if (strcasecmp(argv[i], "export-all") == 0)
+                Command = cm_ExportAll;
+            else if (strcasecmp(argv[i], "info") == 0)
+                Command = cm_Info;
         }
         else if (FileNameIn[0] == '\0')
             strncpy(FileNameIn, argv[i], MAX_PATH);
@@ -1029,6 +1583,9 @@ int main(int argc, char **argv)
         fprintf(stderr, ", try --help\n");
         exit(1);
     }
+
+    if (InfPath)
+        loadInf(InfPath);
 
     switch (Command)
     {
@@ -1059,6 +1616,16 @@ int main(int argc, char **argv)
             break;
         case cm_FixCrc:
             cmdFixCrc(FileNameIn);
+            break;
+        case cm_ExportPng:
+            chkOutFile(FileNameOut);
+            cmdExportPng(FileNameIn, FileNameOut);
+            break;
+        case cm_ExportAll:
+            cmdExportAll(FileNameIn, FileNameOut);
+            break;
+        case cm_Info:
+            cmdInfo(FileNameIn);
             break;
         default:
             break;
